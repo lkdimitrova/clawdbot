@@ -86,6 +86,36 @@ cp .env.example .env
 # Edit .env with your repos, GitHub owner, paths, etc.
 ```
 
+### Agent Authentication
+
+Coding agents need access to their provider's API. There are two ways to authenticate:
+
+**Option A: CLI OAuth login** (recommended — no keys to manage)
+
+Log in once on your machine, and all spawned agents inherit the session:
+
+```bash
+codex auth     # OpenAI / Codex CLI
+claude login   # Anthropic / Claude Code
+gemini auth    # Google / Gemini CLI
+```
+
+Credentials are stored in your home directory (`~/.codex/`, `~/.claude/`, etc.). Since `spawn-agent.sh` runs tmux as the same user, agents pick them up automatically.
+
+**Option B: API keys** (for headless servers or CI environments)
+
+Set keys in `~/.clawdbot/.env` — only the ones you use:
+
+```bash
+OPENAI_API_KEY="sk-..."          # Codex CLI
+ANTHROPIC_API_KEY="sk-ant-..."   # Claude Code
+GEMINI_API_KEY="AIza..."         # Gemini CLI
+```
+
+`spawn-agent.sh` sources `.env` before launching agents, so keys are automatically available. `.env` is gitignored and never committed.
+
+You can also set keys in your shell profile (`~/.bashrc`) — same effect.
+
 Create the runtime directories:
 
 ```bash
@@ -108,6 +138,70 @@ crontab -e
 # Swarm monitor (zero-LLM, wakes orchestrator only on events)
 */3 * * * * /home/YOU/.clawdbot/swarm-monitor.sh
 ```
+
+## Connecting to your OpenClaw agent
+
+clawdbot is the infrastructure — your OpenClaw agent is the brain that drives it. You need to tell your agent that `~/.clawdbot/` exists and how to use it.
+
+### 1. Tell your agent about clawdbot
+
+Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
+
+```markdown
+## Coding Agent Swarm
+
+~/.clawdbot/ contains the swarm orchestration toolkit.
+- Spawn agents: `~/.clawdbot/spawn-agent.sh <task-id> <repo-path> <branch-name> <agent: codex|claude|gemini> <model> <thinking: low|medium|high|xhigh> "<prompt>"`
+- Check status: `~/.clawdbot/check-agents.sh`
+- Clean up: `~/.clawdbot/cleanup-task.sh <task-id>`
+- PR status: `~/.clawdbot/pr-unified-status.sh`
+```
+
+### 2. Install the swarm skill (recommended)
+
+The swarm skill (`SKILL.md` in this repo) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle. Copy it into your OpenClaw skills directory:
+
+```bash
+mkdir -p ~/.openclaw/skills/swarm
+cp ~/.clawdbot/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
+```
+
+With the skill installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* and your agent handles the rest — worktree creation, prompt injection, tmux session, and monitoring.
+
+### 3. How the pieces connect
+
+```
+You (chat with your OpenClaw agent)
+ ↓
+"Fix the auth bug and add the dashboard feature"
+ ↓
+OpenClaw agent reads swarm skill → calls spawn-agent.sh (×2)
+ ↓
+Coding agents work in isolated worktrees → push → open PRs
+ ↓
+swarm-monitor.sh (cron) detects CI failure / PR ready
+ ↓
+`openclaw cron wake` → wakes your agent
+ ↓
+Agent auto-fixes CI, resolves reviews, notifies you when ready
+ ↓
+You review and merge to main
+```
+
+The cron jobs (`swarm-monitor.sh`, `pr-manager.sh`) are the glue — they run pure bash with zero LLM cost, and only wake your OpenClaw agent when something actually needs attention.
+
+### 4. Customize AGENTS.md
+
+`AGENTS.md` is injected into every spawned agent's worktree. This is where you encode your team's standards:
+
+- TDD requirements
+- Code style and conventions
+- Git commit format
+- PR description template
+- Which skills to load
+- What NOT to do
+
+Edit it to match your workflow. The default covers TDD, conventional commits, and clean code.
 
 ## Configuration
 
@@ -267,18 +361,6 @@ The result: agents code, push, get reviewed, fix review feedback, and re-push �
 | Gemini | `gemini` | `--yolo`, configurable model |
 
 Adjust defaults in `spawn-agent.sh` or override via `.env`.
-
-## AGENTS.md
-
-The template instruction file injected into every agent's worktree. This is where you encode:
-- Coding standards and conventions
-- TDD requirements (RED→GREEN→REFACTOR)
-- Git discipline (branch naming, commit messages)
-- PR description format
-- Testing requirements
-- What NOT to do
-
-Customize this for your team's workflow.
 
 ## Agent skills
 
