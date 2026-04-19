@@ -120,7 +120,15 @@ done
 # + resolve each thread one API call at a time. Shorter timeouts kill
 # partially-completed loops and leave PRs worse than they started.
 HANDLER_MODEL="${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-7}"
-HANDLER_TIMEOUT_SECONDS="${CLAWDBOT_HANDLER_TIMEOUT_SECONDS:-1200}"
+# Validate the timeout through the same positive-int helper the other
+# numeric tunables use so a typo in .env fails visibly here instead of
+# at every handler spawn (coderabbit _EhD, clawdbot#24).
+HANDLER_TIMEOUT_SECONDS=$(_parse_positive_int "${CLAWDBOT_HANDLER_TIMEOUT_SECONDS:-1200}" 1200 CLAWDBOT_HANDLER_TIMEOUT_SECONDS)
+# Thinking level is configurable because not every model supports
+# ``high`` (gemini _Eb6, clawdbot#24). ``openclaw cron add --thinking``
+# accepts off|minimal|low|medium|high|xhigh; anything else fails at
+# spawn time, so we let openclaw validate rather than shadow its list.
+HANDLER_THINKING="${CLAWDBOT_HANDLER_THINKING:-high}"
 HANDLER_CHANNEL="${CLAWDBOT_NOTIFY_CHANNEL:-telegram}"
 HANDLER_TARGET="${CLAWDBOT_NOTIFY_TARGET:-}"
 
@@ -158,14 +166,17 @@ _spawn_handler_subagent() {
     local event="$1"         # review_comments | ci_failed
     local pr_key="$2"        # owner/repo#N
     local envelope="$3"      # header + footer + ```json\n<JSON>\n``` text payload
-    local name="pr-handler-${event}-$(echo "$pr_key" | tr '/#' '--')-$(date -u +%s)"
+    # Portable timestamp via jq (gemini _Eb8): ``date -u +%s`` works on
+    # Linux + BSD, but the rest of the script uses jq for time math, so
+    # keep the tooling consistent.
+    local name="pr-handler-${event}-$(echo "$pr_key" | tr '/#' '--')-$(jq -rn 'now | floor')"
 
     if [ -z "$HANDLER_TARGET" ]; then
         echo "$LOG_PREFIX ⚠️ CLAWDBOT_NOTIFY_TARGET not set; cannot spawn handler" >&2
         return 1
     fi
 
-    # Fire and forget — ``--at +5s --delete-after-run`` creates a one-shot
+    # Fire and forget — ``--at 10s --delete-after-run`` creates a one-shot
     # cron job that self-cleans after completion. The job itself uses
     # ``--session isolated`` + ``--message`` (kind=agentTurn) which is the
     # isolated-subagent primitive (same contract as sessions_spawn). The
@@ -173,10 +184,10 @@ _spawn_handler_subagent() {
     if openclaw cron add \
         --name "$name" \
         --session isolated \
-        --at "+5s" \
+        --at "10s" \
         --delete-after-run \
         --model "$HANDLER_MODEL" \
-        --thinking high \
+        --thinking "$HANDLER_THINKING" \
         --timeout-seconds "$HANDLER_TIMEOUT_SECONDS" \
         --announce \
         --channel "$HANDLER_CHANNEL" \
@@ -607,8 +618,11 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
 
     # Strip the internal _state_* bookkeeping fields before rendering —
     # the handler subagent only sees the public envelope shape documented
-    # in the header comment.
-    ENVELOPE=$(echo "$BLOB" | jq 'del(._state_key, ._state_sha_key, ._state_ts)')
+    # in the header comment. ``jq -c`` (compact output, gemini _EcA)
+    # trims a ~3x whitespace overhead from the serialised envelope so
+    # long review threads don't risk hitting E2BIG when the payload is
+    # passed to ``openclaw cron add --message``.
+    ENVELOPE=$(echo "$BLOB" | jq -c 'del(._state_key, ._state_sha_key, ._state_ts)')
     TEXT=$(printf '%s\n\n%s\n\n```json\n%s\n```' "$HEADER" "$FOOTER" "$ENVELOPE")
 
     if _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"; then
