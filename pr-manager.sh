@@ -686,7 +686,7 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
 INSTRUCTIONS
 
 1. Read pr-review-hygiene skill BEFORE touching the PR.
-2. Parse the ENVELOPE JSON below.
+2. Read the envelope JSON from the file path shown below this instruction block (use the ``read`` tool, then ``jq`` if you need to slice it). The envelope has the PR id, url, head_sha, CI status, and the full list of unresolved threads with author/path/line/body/created_at for each comment.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. Escalate via sessions_send to main label='main' for any product/design call you can't make unilaterally. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' and include the affected thread_ids so the main session knows which PR and which threads you couldn't handle.
 
@@ -702,7 +702,7 @@ Completion summary template (final reply — escalation path):
 INSTRUCTIONS
 
 1. Read pr-review-hygiene skill BEFORE touching the PR.
-2. Parse the ENVELOPE JSON below. failed_job_logs has the tail of the red job.
+2. Read the envelope JSON from the file path shown below this instruction block (use the ``read`` tool, then ``jq`` if you need to slice it). ``failed_job_logs`` has the tail of the red job.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. Escalate via sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' so the main session can route it.
 
@@ -713,29 +713,28 @@ Completion summary template (final reply — escalation path):
 [ESCALATION] ${PR_KEY} <infra-level or design reason>."
     fi
 
-    # Strip the internal _state_* bookkeeping fields before rendering.
-    # ``jq -c`` (compact output, gemini _EcA) trims whitespace so long
-    # review threads don't risk hitting E2BIG when the payload is passed
-    # to ``openclaw cron add --message`` (still enforced in #26).
-    ENVELOPE=$(echo "$BLOB" | jq -c 'del(._state_key, ._state_sha_key, ._state_ts)')
-
-    # Envelope is delivered as a labeled single-line ``ENVELOPE:<json>`` row
-    # rather than a markdown ```json fenced block. Review-bot comment
-    # bodies routinely contain nested ```typescript / ```diff fences
-    # (cursor, coderabbit, gemini all embed code suggestions), and when
-    # the outer ```json envelope gets re-rendered by the subagent's chat
-    # extractor, the first nested ``` is mistaken for the closing fence.
-    # That truncates the JSON mid-body and the subagent hits a
-    # ``Expected double-quoted property name`` parse error at position
-    # ~80-1080, with no way to recover. A labeled single line has no
-    # nested-delimiter ambiguity — whatever parser the subagent uses
-    # reads the whole rest of the line as the payload. (PR #24 shipped
-    # the fenced form; #26 fixes the nested-fence trap.)
+    # Envelope is written to a TEMP FILE and the handler is told to
+    # ``Read`` it — rather than inlining the JSON (fenced or labeled)
+    # inside the ``--message`` argument passed to ``openclaw cron add``.
+    # This mirrors the original Apr 14 design (clawdbot@6c80d2a) which
+    # never hit JSON-parse errors regardless of comment-body contents.
     #
-    # Trailing ``\n`` (gemini _BbKE) keeps the final line terminated for
-    # line-oriented tools that downstream tooling may pipe the message
-    # through (``grep``, ``awk``, ``tail -f``, etc).
-    TEXT=$(printf '%s\n\n%s\n\nENVELOPE: %s\n' "$HEADER" "$FOOTER" "$ENVELOPE")
+    # Why file-based wins: review-bot comment bodies routinely contain
+    # nested ```typescript / ```diff / ```markdown fences (cursor,
+    # coderabbit, gemini, greptile) AND now-and-again partial-stream
+    # truncation inside the subagent's own tool-call ``arguments``
+    # serialization when context rebuilds mid-reply. Both classes of
+    # bug vanish when the envelope never has to round-trip through
+    # the agent's prompt-text parser at all — the handler just calls
+    # ``read(path)`` and jq-parses the raw file.
+    #
+    # Filename includes the epoch-seconds so parallel ticks for the
+    # same PR don't collide. Stale files are reaped at the end of
+    # this script (``find /tmp -name 'pr-handler-*.json' -mtime +1``).
+    ENVELOPE_FILE=$(printf '/tmp/pr-handler-%s-%s.json' "$(echo "$PR_KEY" | tr '/#' '--')" "$(jq -rn 'now | floor')")
+    echo "$BLOB" | jq 'del(._state_key, ._state_sha_key, ._state_ts)' > "$ENVELOPE_FILE"
+
+    TEXT=$(printf '%s\n\n%s\n\nRead the envelope JSON at: %s\n' "$HEADER" "$FOOTER" "$ENVELOPE_FILE")
 
     if _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"; then
         echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
@@ -783,5 +782,12 @@ else
       | .notified_ci = (.notified_ci // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
     ' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
 fi
+
+# Reap handler-envelope temp files older than 24h. A successful handler
+# run doesn't need the envelope anymore (it's already been read into
+# the isolated session's context). Handlers that failed or were killed
+# mid-run also leave files behind — 24h is generous enough that a
+# long-running handler (20 min cap) can't race the reaper.
+find /tmp -maxdepth 1 -name 'pr-handler-*.json' -mtime +1 -delete 2>/dev/null || true
 
 echo "$LOG_PREFIX Done."
