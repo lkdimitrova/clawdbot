@@ -404,16 +404,19 @@ else
     fail "READY_MAIN does not queue into PENDING_MAIN_NOTIFICATIONS"
 fi
 
-# 2. The jq write must live inside an `if _wake_sparky ...; then` block
-#    and iterate over PENDING_MAIN_NOTIFICATIONS. We check for the two
-#    anchors appearing close together.
+# 2. The jq write must live inside an `if _announce_to_maintainer ...; then`
+#    block and iterate over PENDING_MAIN_NOTIFICATIONS. We check for the
+#    two anchors appearing close together. (Previously this gate was on
+#    ``_wake_sparky`` — PR #24 renamed it to ``_announce_to_maintainer``
+#    when merge/no-op reports were split off from the handler-spawn path
+#    and sent direct to the maintainer instead.)
 if awk '/^if \[ -n "\$MERGE_REASONS" \]; then$/,/^fi$/' "$PRM" \
-     | grep -q 'if _wake_sparky' \
+     | grep -q 'if _announce_to_maintainer' \
    && awk '/^if \[ -n "\$MERGE_REASONS" \]; then$/,/^fi$/' "$PRM" \
      | grep -q 'PENDING_MAIN_NOTIFICATIONS'; then
-    pass "notified_main_prs commit is gated on _wake_sparky success"
+    pass "notified_main_prs commit is gated on _announce_to_maintainer success"
 else
-    fail "notified_main_prs commit is not gated on _wake_sparky success"
+    fail "notified_main_prs commit is not gated on _announce_to_maintainer success"
 fi
 echo ""
 
