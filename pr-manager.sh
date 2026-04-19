@@ -598,8 +598,8 @@ for REPO in $REPOS; do
     # branch strictly gated on real branch state.
     MAIN_SHA=$(gh api "repos/$REPO/branches/$MAIN_BRANCH" --jq '.commit.sha' 2>/dev/null || true)
     DEV_SHA=$(gh api "repos/$REPO/branches/$INTEGRATION_BRANCH" --jq '.commit.sha' 2>/dev/null || true)
-    if ! [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then MAIN_SHA=""; fi
-    if ! [[ "$DEV_SHA"  =~ ^[0-9a-f]{40}$ ]]; then DEV_SHA=""; fi
+    [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || MAIN_SHA=""
+    [[ "$DEV_SHA"  =~ ^[0-9a-f]{40}$ ]] || DEV_SHA=""
 
     if [ -n "$MAIN_SHA" ] && [ -n "$DEV_SHA" ] && [ "$MAIN_SHA" != "$DEV_SHA" ]; then
         # Same defensive pattern for the ahead/behind counts: we already
@@ -616,7 +616,7 @@ for REPO in $REPOS; do
         [[ "$AHEAD" =~ ^[0-9]+$ ]] || AHEAD=0
         [[ "$EXISTING_DEV_MAIN" =~ ^[0-9]+$ ]] || EXISTING_DEV_MAIN=0
 
-        if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" = "0" ] && [ "$EXISTING_DEV_MAIN" = "0" ]; then
+        if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ] && [ "$EXISTING_DEV_MAIN" -eq 0 ]; then
             echo "$LOG_PREFIX   ⏩ Fast-forwarding $INTEGRATION_BRANCH to $MAIN_BRANCH ($BEHIND commits behind)..."
             if gh api "repos/$REPO/git/refs/heads/$INTEGRATION_BRANCH" -X PATCH -f sha="$MAIN_SHA" 2>/dev/null; then
                 echo "$LOG_PREFIX   ✅ $INTEGRATION_BRANCH fast-forwarded to $MAIN_BRANCH"
@@ -624,7 +624,7 @@ for REPO in $REPOS; do
             else
                 echo "$LOG_PREFIX   ⚠️ Fast-forward failed"
             fi
-        elif [ "$AHEAD" -gt 0 ] && [ "$EXISTING_DEV_MAIN" = "0" ]; then
+        elif [ "$AHEAD" -gt 0 ] && [ "$EXISTING_DEV_MAIN" -eq 0 ]; then
             OPEN_FEATURE_TO_DEV=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $integration and .isDraft == false)] | length')
             if [ "$OPEN_FEATURE_TO_DEV" -gt 0 ]; then
                 echo "$LOG_PREFIX   ⏸️ Not creating ${INTEGRATION_BRANCH}→${MAIN_BRANCH} PR — $OPEN_FEATURE_TO_DEV open feature→${INTEGRATION_BRANCH} PR(s) still in flight"
