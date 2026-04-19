@@ -690,16 +690,33 @@ INSTRUCTIONS
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. Escalate via sessions_send to main label='main' for any product/design call you can't make unilaterally. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' and include the affected thread_ids so the main session knows which PR and which threads you couldn't handle.
 
-Completion summary template (final reply — success path):
-PR ${PR_KEY} (<head_branch>→<base_branch>) head=<new_sha>: <N> threads resolved, <M> deferred. <one-line net code change>. CI: <status>. mergeStateStatus: <literal value from gh pr view>.
+Final reply format — this lands in the maintainer's Telegram. Humans read it on their phone. Keep it short, human, tappable.
 
-Rules for the summary line:
-- <head_branch> and <base_branch> come from the envelope file's \`head\` and \`base\` fields. Copy them verbatim — do NOT infer.
-- mergeStateStatus is the literal value returned by \`gh pr view <N> --json mergeStateStatus\` (e.g. CLEAN, BLOCKED, UNSTABLE, DIRTY, BEHIND, DRAFT). Do NOT interpret it (e.g. do not translate BLOCKED into 'awaiting human approval' — you do not know which protection rule caused it).
-- Keep the summary to ONE line. No multi-paragraph narration.
+Success path — two lines:
+  ✅ <short-repo>#<number>: <one plain-English sentence>
+  <url>
 
-Completion summary template (final reply — escalation path):
-[ESCALATION] ${PR_KEY} (<head_branch>→<base_branch>) <reason>. threads=<comma-separated thread_ids>."
+Example sentences:
+  - 3 review threads resolved, mobile drag regression fixed
+  - CI failure addressed, 112/112 tests green
+  - 2 of 4 threads resolved, 2 deferred pending a product call
+
+Escalation path — two lines:
+  ⚠️ <short-repo>#<number> needs you — <one plain-English reason>
+  <url>
+
+Escalation examples:
+  - 15 review threads, too many to handle inline
+  - coderabbit + cursor disagree on the fix, design call needed
+
+Rules:
+- Two lines only. No preamble, no structured tags, no SHA, no mergeStateStatus, no head or base annotations, no markdown fences.
+- Start with the emoji, then <short-repo>#<number>. <short-repo> is the suffix after the slash in pr_key.
+- Keep the sentence under 100 characters. No jargon like isOutdated / ContextVar / mergeStateStatus — plain English.
+
+Internal verification — NOT shown to the maintainer. Before posting the success reply, confirm the PR state via gh pr view and the unresolved-threads GraphQL actually matches what you plan to claim. If it does not, use the escalation format.
+
+For escalations you route via sessions_send to the main session label=main, the sessions_send body MUST still carry the structured context [ESCALATION] ${PR_KEY} head=<head_branch> base=<base_branch> reason=<reason> threads=<comma-separated thread_ids> — the main-session orchestrator needs those fields. The Telegram announce to the maintainer stays human."
     else
         HEADER="🔴 PR handler: $PR_KEY has a failed CI run (all review threads resolved)."
         FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then fix the failed CI via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/).
@@ -711,16 +728,17 @@ INSTRUCTIONS
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. Escalate via sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' so the main session can route it.
 
-Completion summary template (final reply — success path):
-PR ${PR_KEY} (<head_branch>→<base_branch>) head=<new_sha>: CI fixed by <one-line change>. New run: <status>. mergeStateStatus: <literal value from gh pr view>.
+Final reply format — this lands in the maintainer's Telegram. Keep it short, human, tappable.
 
-Rules for the summary line:
-- <head_branch> and <base_branch> come from the envelope file's \`head\` and \`base\` fields. Copy them verbatim — do NOT infer.
-- mergeStateStatus is the literal value returned by \`gh pr view <N> --json mergeStateStatus\`. Do NOT interpret it.
-- Keep the summary to ONE line.
+Success path — two lines:
+  ✅ <short-repo>#<number>: <one plain-English sentence about the fix>
+  <url>
 
-Completion summary template (final reply — escalation path):
-[ESCALATION] ${PR_KEY} (<head_branch>→<base_branch>) <infra-level or design reason>."
+Escalation path — two lines:
+  ⚠️ <short-repo>#<number> needs you — <one plain-English reason>
+  <url>
+
+Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head→base) annotation, no jargon, under 100 chars, start with emoji + short repo name. The sessions_send body for escalations still carries the structured [ESCALATION] envelope for main-session routing."
     fi
 
     # Envelope is written to a TEMP FILE and the handler is told to
