@@ -596,25 +596,64 @@ for REPO in $REPOS; do
     # downstream integer comparisons would blow up with non-integer
     # values. A strict hex regex here keeps the fast-forward / PR-create
     # branch strictly gated on real branch state.
-    MAIN_SHA=$(gh api "repos/$REPO/branches/$MAIN_BRANCH" --jq '.commit.sha' 2>/dev/null || true)
-    DEV_SHA=$(gh api "repos/$REPO/branches/$INTEGRATION_BRANCH" --jq '.commit.sha' 2>/dev/null || true)
-    [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || MAIN_SHA=""
-    [[ "$DEV_SHA"  =~ ^[0-9a-f]{40}$ ]] || DEV_SHA=""
+    #
+    # Fail closed: if either lookup fails transiently (network blip,
+    # rate-limit, GitHub 5xx), skip the branch-sync tick for this repo
+    # entirely rather than falling back to empty/0 which would make the
+    # downstream gate equivalent to "no open PR, go ahead and act".
+    if ! MAIN_SHA=$(gh api "repos/$REPO/branches/$MAIN_BRANCH" --jq '.commit.sha' 2>/dev/null); then
+        echo "$LOG_PREFIX   ⚠️ Failed to fetch $MAIN_BRANCH SHA for $REPO; skipping branch-sync" >&2
+        continue
+    fi
+    if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "$LOG_PREFIX   ⚠️ Invalid $MAIN_BRANCH SHA for $REPO ('$MAIN_SHA'); skipping branch-sync" >&2
+        continue
+    fi
+    if ! DEV_SHA=$(gh api "repos/$REPO/branches/$INTEGRATION_BRANCH" --jq '.commit.sha' 2>/dev/null); then
+        echo "$LOG_PREFIX   ⚠️ Failed to fetch $INTEGRATION_BRANCH SHA for $REPO; skipping branch-sync" >&2
+        continue
+    fi
+    if [[ ! "$DEV_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "$LOG_PREFIX   ⚠️ Invalid $INTEGRATION_BRANCH SHA for $REPO ('$DEV_SHA'); skipping branch-sync" >&2
+        continue
+    fi
 
-    if [ -n "$MAIN_SHA" ] && [ -n "$DEV_SHA" ] && [ "$MAIN_SHA" != "$DEV_SHA" ]; then
-        # Same defensive pattern for the ahead/behind counts: we already
-        # know both refs resolve, but a transient 404 on the ``compare``
-        # endpoint (observed 2026-04-19 mid-refactor) returned a JSON
-        # body that then fell through ``|| echo "0"`` and ended up
-        # inside a ``[ "$BEHIND" -gt 0 ]`` test, producing the bash
-        # "integer expression expected" error and silent action-skip.
-        # Force a ``0`` fallback on any non-digit output.
-        BEHIND=$(gh api "repos/$REPO/compare/${INTEGRATION_BRANCH}...${MAIN_BRANCH}" --jq '.ahead_by' 2>/dev/null || true)
-        AHEAD=$(gh api "repos/$REPO/compare/${MAIN_BRANCH}...${INTEGRATION_BRANCH}" --jq '.ahead_by' 2>/dev/null || true)
-        EXISTING_DEV_MAIN=$(gh pr list --repo "$REPO" --base "$MAIN_BRANCH" --head "$INTEGRATION_BRANCH" --state open --json number --jq 'length' 2>/dev/null || true)
-        [[ "$BEHIND" =~ ^[0-9]+$ ]] || BEHIND=0
-        [[ "$AHEAD" =~ ^[0-9]+$ ]] || AHEAD=0
-        [[ "$EXISTING_DEV_MAIN" =~ ^[0-9]+$ ]] || EXISTING_DEV_MAIN=0
+    if [ "$MAIN_SHA" != "$DEV_SHA" ]; then
+        # Same fail-closed discipline for the ahead/behind counts and the
+        # open-PR count: a transient 404 on the ``compare`` endpoint
+        # (observed 2026-04-19 mid-refactor) used to return a JSON body
+        # that fell through ``|| echo "0"`` into a ``[ "$BEHIND" -gt 0 ]``
+        # test, producing the bash "integer expression expected" error
+        # and silently skipping the action. Worse, coercing a failed
+        # ``gh pr list`` to ``0`` used to make the fast-forward / PR-
+        # create gate treat "I couldn't tell" as "no open PR, safe to
+        # act" — exactly the wrong direction for a write operation on a
+        # shared branch. Skip the tick on any lookup failure or non-
+        # integer response and let the next tick retry.
+        if ! BEHIND=$(gh api "repos/$REPO/compare/${INTEGRATION_BRANCH}...${MAIN_BRANCH}" --jq '.ahead_by' 2>/dev/null); then
+            echo "$LOG_PREFIX   ⚠️ compare ${INTEGRATION_BRANCH}...${MAIN_BRANCH} failed for $REPO; skipping branch-sync" >&2
+            continue
+        fi
+        if [[ ! "$BEHIND" =~ ^[0-9]+$ ]]; then
+            echo "$LOG_PREFIX   ⚠️ Invalid BEHIND value for $REPO ('$BEHIND'); skipping branch-sync" >&2
+            continue
+        fi
+        if ! AHEAD=$(gh api "repos/$REPO/compare/${MAIN_BRANCH}...${INTEGRATION_BRANCH}" --jq '.ahead_by' 2>/dev/null); then
+            echo "$LOG_PREFIX   ⚠️ compare ${MAIN_BRANCH}...${INTEGRATION_BRANCH} failed for $REPO; skipping branch-sync" >&2
+            continue
+        fi
+        if [[ ! "$AHEAD" =~ ^[0-9]+$ ]]; then
+            echo "$LOG_PREFIX   ⚠️ Invalid AHEAD value for $REPO ('$AHEAD'); skipping branch-sync" >&2
+            continue
+        fi
+        if ! EXISTING_DEV_MAIN=$(gh pr list --repo "$REPO" --base "$MAIN_BRANCH" --head "$INTEGRATION_BRANCH" --state open --json number --jq 'length' 2>/dev/null); then
+            echo "$LOG_PREFIX   ⚠️ Could not determine existing ${INTEGRATION_BRANCH}→${MAIN_BRANCH} PR count for $REPO; skipping branch-sync" >&2
+            continue
+        fi
+        if [[ ! "$EXISTING_DEV_MAIN" =~ ^[0-9]+$ ]]; then
+            echo "$LOG_PREFIX   ⚠️ Invalid ${INTEGRATION_BRANCH}→${MAIN_BRANCH} PR count for $REPO ('$EXISTING_DEV_MAIN'); skipping branch-sync" >&2
+            continue
+        fi
 
         if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ] && [ "$EXISTING_DEV_MAIN" -eq 0 ]; then
             echo "$LOG_PREFIX   ⏩ Fast-forwarding $INTEGRATION_BRANCH to $MAIN_BRANCH ($BEHIND commits behind)..."
