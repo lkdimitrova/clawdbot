@@ -158,6 +158,28 @@ _announce_to_maintainer() {
     return 1
 }
 
+# Wake the main orchestrator session (Sparky) with a system event. This
+# mirrors the handler-runtime \`\`sessions_send\`\` escalation path the
+# pr-review-hygiene skill documents — for bash-level short-circuits
+# (oversized thread aggregates) we call this directly so Sparky gets
+# explicitly notified, not just the maintainer's Telegram.
+#
+# The skill requires escalation messages to start with
+# \`\`[ESCALATION] <pr_key>\`\`; callers are responsible for preserving
+# that contract. \`\`--mode now\`\` enqueues immediately and triggers a
+# heartbeat so Sparky picks up the event on her next tick.
+_wake_main_session() {
+    local text="$1"
+    if openclaw system event \
+        --mode now \
+        --text "$text" \
+        --timeout 5000 >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "$LOG_PREFIX ⚠️ Failed to wake main session; state not marked notified, will retry next tick" >&2
+    return 1
+}
+
 # Spawn an isolated handler subagent for a structured PR event (review_comments
 # or ci_failed). The agent gets the envelope as its message payload, runs
 # with the pr-review-hygiene skill, acts end-to-end on the PR, and reports
@@ -624,17 +646,32 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
         # chew through 15-thread envelopes on 2026-04-19 hit token/abort
         # loops mid-run. Short-circuit in bash instead of paying for an
         # LLM spawn whose only job is to count and exit.
+        #
+        # Two-channel delivery (coderabbit _BgUR, clawdbot#26 round 2).
+        # Telegram alone is fire-and-forget — the maintainer sees it but
+        # the main orchestrator session (Sparky) stays unaware, which
+        # violates the documented ``sessions_send`` escalation contract
+        # in the pr-review-hygiene skill. So we BOTH announce to the
+        # maintainer AND wake Sparky. State is only marked notified when
+        # both deliveries succeed — a partial failure leaves the SHA
+        # "not notified" so the next tick retries.
         if [ "$THREAD_COUNT" -gt "$HANDLER_MAX_INLINE_THREADS" ]; then
             PR_URL=$(echo "$BLOB" | jq -r '.url')
             THREAD_IDS=$(echo "$BLOB" | jq -r '[.unresolved_threads[].thread_id] | join(",")')
             ESCALATION_MSG=$(printf '[ESCALATION] %s has %s unresolved review thread(s) — above the inline-handler threshold (%s). Aggregate review PRs are orchestration work. threads=%s url=%s' \
                 "$PR_KEY" "$THREAD_COUNT" "$HANDLER_MAX_INLINE_THREADS" "$THREAD_IDS" "$PR_URL")
-            echo "$LOG_PREFIX     🚨 Thread count $THREAD_COUNT > $HANDLER_MAX_INLINE_THREADS; escalating to maintainer instead of spawning handler"
-            if _announce_to_maintainer "$ESCALATION_MSG"; then
+            echo "$LOG_PREFIX     🚨 Thread count $THREAD_COUNT > $HANDLER_MAX_INLINE_THREADS; escalating to maintainer + main session (no handler spawn)"
+            ANNOUNCE_OK=0
+            WAKE_OK=0
+            _announce_to_maintainer "$ESCALATION_MSG" && ANNOUNCE_OK=1
+            _wake_main_session       "$ESCALATION_MSG" && WAKE_OK=1
+            if [ "$ANNOUNCE_OK" -eq 1 ] && [ "$WAKE_OK" -eq 1 ]; then
                 if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
                     jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
                         '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                 fi
+            else
+                echo "$LOG_PREFIX     ⚠️ Escalation partial (announce=$ANNOUNCE_OK wake=$WAKE_OK); not marking notified, will retry next tick" >&2
             fi
             continue
         fi
