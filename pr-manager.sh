@@ -610,20 +610,52 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
 
     if [ "$EVENT" = "review_comments" ]; then
         HEADER="📝 PR handler: $PR_KEY has $(echo "$BLOB" | jq '.unresolved_threads | length') unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
-        FOOTER="You are an isolated handler subagent. Read the \`pr-review-hygiene\` skill first, then own this PR end-to-end: aggregate the comments by theme + severity, write a short plan, fix inline for surgical changes or delegate to a swarm agent for larger refactors. Commits land on the PR's head branch via the pr-worktree pattern (\`~/pr-work/<repo>/pr-<N>/\`). Reply + resolve each thread when done. Report a concise completion summary at the end. Escalate to the main session via \`sessions_send\` with an \`[ESCALATION]\` prefix only if a product/design decision is required."
+        FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then own this PR end-to-end via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/): commit fixes, push, reply + resolve each thread.
+
+INSTRUCTIONS
+
+1. Read pr-review-hygiene skill BEFORE touching the PR.
+2. Parse the ENVELOPE JSON below.
+3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end: the completion summary.
+4. If the envelope carries more than 7 unresolved threads, DO NOT attempt to fix them inline. Emit a single final reply with the comma-separated thread_ids prefixed by [ESCALATION] and send it via sessions_send to the main session label='main'. Then exit.
+5. Escalate via [ESCALATION] + sessions_send for any product/design call you can't make unilaterally.
+
+Completion summary template (final reply):
+PR <pr_key> head=<new_sha>: <N> threads resolved, <M> deferred. <one-line net code change>. CI: <status>."
     else
         HEADER="🔴 PR handler: $PR_KEY has a failed CI run (all review threads resolved)."
-        FOOTER="You are an isolated handler subagent. Read the \`pr-review-hygiene\` skill first, then own this PR end-to-end: review the failed_job_logs field, diagnose the root cause, plan the fix. Commit to the PR's head branch via the pr-worktree pattern (\`~/pr-work/<repo>/pr-<N>/\`) so CI re-runs. Report a concise completion summary at the end. Escalate to the main session via \`sessions_send\` with an \`[ESCALATION]\` prefix only if the failure is infra-level (not a code bug) or requires a design call."
+        FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then fix the failed CI via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/).
+
+INSTRUCTIONS
+
+1. Read pr-review-hygiene skill BEFORE touching the PR.
+2. Parse the ENVELOPE JSON below. failed_job_logs has the tail of the red job.
+3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
+4. Escalate via [ESCALATION] + sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call.
+
+Completion summary template (final reply):
+PR <pr_key> head=<new_sha>: CI fixed by <one-line change>. New run: <status>."
     fi
 
-    # Strip the internal _state_* bookkeeping fields before rendering —
-    # the handler subagent only sees the public envelope shape documented
-    # in the header comment. ``jq -c`` (compact output, gemini _EcA)
-    # trims a ~3x whitespace overhead from the serialised envelope so
-    # long review threads don't risk hitting E2BIG when the payload is
-    # passed to ``openclaw cron add --message``.
+    # Strip the internal _state_* bookkeeping fields before rendering.
+    # ``jq -c`` (compact output, gemini _EcA) trims whitespace so long
+    # review threads don't risk hitting E2BIG when the payload is passed
+    # to ``openclaw cron add --message``.
     ENVELOPE=$(echo "$BLOB" | jq -c 'del(._state_key, ._state_sha_key, ._state_ts)')
-    TEXT=$(printf '%s\n\n%s\n\n```json\n%s\n```' "$HEADER" "$FOOTER" "$ENVELOPE")
+
+    # Envelope is delivered as a labeled single-line ``ENVELOPE:<json>`` row
+    # rather than a markdown ```json fenced block. Review-bot comment
+    # bodies routinely contain nested ```typescript / ```diff fences
+    # (cursor, coderabbit, gemini all embed code suggestions), and when
+    # the outer ```json envelope gets re-rendered by the subagent's chat
+    # extractor, the first nested ``` is mistaken for the closing fence.
+    # That truncates the JSON mid-body and the subagent hits a
+    # ``Expected double-quoted property name`` parse error at position
+    # ~80-1080, with no way to recover. A labeled single line has no
+    # nested-delimiter ambiguity — whatever parser the subagent uses
+    # reads the whole rest of the line as the payload. (PR #24 shipped
+    # the fenced form; #26 fixes the nested-fence trap.)
+    TEXT=$(printf '%s\n\n%s\n\nENVELOPE: %s' "$HEADER" "$FOOTER" "$ENVELOPE")
 
     if _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"; then
         echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
