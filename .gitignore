@@ -11,6 +11,7 @@ logs/
 prompts/
 runners/
 memory/
+bin/
 
 # Editor
 *.swp

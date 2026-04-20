@@ -18,12 +18,16 @@ export SPAWN_AGENT_CONTEXT=1
 export PATH="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}:$HOME/.local/bin:$PATH"
 
 # ── gh wrapper: enforce base branch + stamp attribution ──
-# Generated at runtime into a temp dir (not committed to repo).
+# Generated at runtime into a per-task dir under ~/.clawdbot/bin/. Previous
+# versions used mktemp under $TMPDIR and `trap cleanup EXIT`, but since the
+# runner is nohup-launched and outlives spawn-agent.sh, the trap deleted
+# the wrapper before the runner could use it — the agent fell through to
+# the real /opt/homebrew/bin/gh and `--base` enforcement was lost. The
+# persistent per-task dir is cleaned by cleanup-task.sh after merge.
 REAL_GH_BIN="$(command -v gh || true)"
-CLAWDBOT_BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/clawdbot-bin.XXXXXX")"
+CLAWDBOT_BIN_DIR="$HOME/.clawdbot/bin/${1:-unknown}"
+mkdir -p "$CLAWDBOT_BIN_DIR"
 _INTEGRATION="${CLAWDBOT_INTEGRATION_BRANCH:-development}"
-cleanup_bin_dir() { rm -rf "$CLAWDBOT_BIN_DIR"; }
-trap cleanup_bin_dir EXIT
 if [ -n "$REAL_GH_BIN" ]; then
   cat > "$CLAWDBOT_BIN_DIR/gh" <<'GHWRAPPER'
 #!/usr/bin/env bash
@@ -92,6 +96,14 @@ THINKING="${6:?Missing thinking level}"
 PROMPT="${7:?Missing prompt}"
 
 REGISTRY="$HOME/.clawdbot/active-tasks.json"
+# Initialize as an empty array if missing or empty. jq errors on missing
+# input and leaves behind a 0-byte .tmp file; that in turn surfaces as a
+# spawn-agent.sh failure Sparky interprets as "spawn didn't work" —
+# prompting her to fall back to manually running the runner, resulting in
+# two concurrent claude processes against the same worktree.
+if [ ! -s "$REGISTRY" ]; then
+  echo '[]' > "$REGISTRY"
+fi
 # Keep worktrees inside each repo for locality/isolation, e.g. <repo>/.worktrees/<task-id>
 WORKTREE_BASE="$REPO_PATH/.worktrees"
 WORKTREE_DIR="$WORKTREE_BASE/$TASK_ID"

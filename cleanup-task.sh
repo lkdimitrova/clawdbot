@@ -15,6 +15,7 @@ WORKTREE=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .worktree' "$RE
 REPO_PATH=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .repoPath' "$REGISTRY")
 TMUX_SESSION=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .tmuxSession' "$REGISTRY")
 RUNNER_PID=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .runnerPid // empty' "$REGISTRY")
+CLAWDBOT_BIN_DIR="$HOME/.clawdbot/bin/$TASK_ID"
 
 # Kill the nohup'd runner process tree if still alive (primary since the
 # tmux session may legitimately not exist).
@@ -27,6 +28,9 @@ fi
 
 # Kill tmux observability wrapper if still running (harmless if not).
 tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+
+# Remove the per-task gh-wrapper dir that spawn-agent.sh created.
+[ -d "$CLAWDBOT_BIN_DIR" ] && rm -rf "$CLAWDBOT_BIN_DIR"
 
 # Remove worktree
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
