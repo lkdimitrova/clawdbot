@@ -695,7 +695,8 @@ done
 # reply + resolve threads, report completion to the maintainer. The main
 # orchestrator (Sparky) is NOT in the loop — handlers escalate only when
 # they need a product/design decision.
-for BLOB in "${NOTIFY_BLOBS[@]}"; do
+for BLOB in "${NOTIFY_BLOBS[@]:-}"; do
+    [ -z "$BLOB" ] && continue
     EVENT=$(echo "$BLOB" | jq -r '.event')
     PR_KEY=$(echo "$BLOB" | jq -r '.pr_key')
     STATE_KEY=$(echo "$BLOB" | jq -r '._state_key // empty')

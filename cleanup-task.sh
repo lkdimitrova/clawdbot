@@ -14,8 +14,18 @@ REGISTRY="$HOME/.clawdbot/active-tasks.json"
 WORKTREE=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .worktree' "$REGISTRY")
 REPO_PATH=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .repoPath' "$REGISTRY")
 TMUX_SESSION=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .tmuxSession' "$REGISTRY")
+RUNNER_PID=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .runnerPid // empty' "$REGISTRY")
 
-# Kill tmux if still running
+# Kill the nohup'd runner process tree if still alive (primary since the
+# tmux session may legitimately not exist).
+if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
+  # TERM first to let traps fire, KILL after a grace period.
+  kill -TERM "$RUNNER_PID" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$RUNNER_PID" 2>/dev/null || true
+fi
+
+# Kill tmux observability wrapper if still running (harmless if not).
 tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
 # Remove worktree

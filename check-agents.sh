@@ -28,6 +28,7 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
   TASK_ID=$(echo "$TASK" | jq -r '.id')
   STATUS=$(echo "$TASK" | jq -r '.status')
   TMUX_SESSION=$(echo "$TASK" | jq -r '.tmuxSession')
+  RUNNER_PID=$(echo "$TASK" | jq -r '.runnerPid // empty')
   BRANCH=$(echo "$TASK" | jq -r '.branch')
   REPO_PATH=$(echo "$TASK" | jq -r '.repoPath')
   # shellcheck disable=SC2034
@@ -69,9 +70,15 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
     continue
   fi
 
-  # 1. Check if tmux session is alive
+  # 1. Liveness: runner is alive if EITHER its PID is still running OR the
+  # tmux session is up. spawn-agent.sh now launches via nohup (survives
+  # even when tmux dies inside some OpenClaw exec contexts), so the PID
+  # check is primary; tmux is the legacy fallback for entries without
+  # runnerPid set.
   TMUX_ALIVE=false
-  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
+    TMUX_ALIVE=true
+  elif tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     TMUX_ALIVE=true
   fi
 

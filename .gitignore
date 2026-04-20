@@ -1,6 +1,7 @@
 # Runtime state (local only)
 *.json
 !package.json
+*.tmp
 .env
 
 # Logs

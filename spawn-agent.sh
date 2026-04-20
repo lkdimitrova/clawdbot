@@ -10,6 +10,11 @@ set -euo pipefail
 CLAWDBOT_HOME="${CLAWDBOT_HOME:-$HOME/.clawdbot}"
 [ -f "$CLAWDBOT_HOME/.env" ] && set -a && source "$CLAWDBOT_HOME/.env" && set +a
 
+# Signal the ~/.openclaw/bin shims (claude, git) that we are inside a
+# legitimate spawn flow, so they don't block `claude -p` or
+# `git checkout -b agents/*`.
+export SPAWN_AGENT_CONTEXT=1
+
 export PATH="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}:$HOME/.local/bin:$PATH"
 
 # ── gh wrapper: enforce base branch + stamp attribution ──
@@ -100,29 +105,37 @@ mkdir -p "$WORKTREE_BASE" "$LOG_DIR" "$PROMPT_DIR"
 PROMPT_FILE="$PROMPT_DIR/$TASK_ID.md"
 printf '%s' "$PROMPT" > "$PROMPT_FILE"
 
-# Append completion instructions
-cat >> "$PROMPT_FILE" << 'EOF'
+# Append completion instructions (heredoc interpolates $AGENT, $TASK_ID, $_INTEGRATION).
+cat >> "$PROMPT_FILE" <<EOF
 
 ---
 ## When you are completely finished with the coding task above:
 
-1. Run all tests and make sure they pass
-2. Stage all changes: git add -A
-3. Commit with a conventional commit message: git commit -m "feat: <description>"
-4. Push the branch: git push origin HEAD
-5. Create a PR **ONLY** against development (NEVER main):
-   - gh pr create --base development --fill
-6. In the PR body, include this footer (verbatim):
-   - Created-by: <agent>
-   - Task-id: <task-id>
-   - Worktree: <path>
-7. Then exit
+1. Run all tests and make sure they pass.
+2. Stage all changes: \`git add -A\`
+3. Commit with a conventional commit message. In the message body, add a
+   \`Generated-by:\` trailer so the swarm agent that authored the work is
+   attributable (the commit author itself is the maintainer, so Vercel /
+   CI identity checks work). Example:
+
+       git commit -m 'feat: <description>' -m 'Generated-by: $AGENT ($TASK_ID)'
+
+4. Push the branch: \`git push origin HEAD\`
+5. Create a PR against \`$_INTEGRATION\` (NEVER \`main\`, NEVER \`develop\`).
+   A runtime \`gh\` wrapper enforces the base branch and auto-stamps an
+   attribution footer in the PR body, so just run:
+
+       gh pr create --base $_INTEGRATION --fill
+
+   Do not add footer lines yourself; the wrapper handles it.
+6. Then exit.
 EOF
 
 # ── Fetch latest & create worktree ──
 cd "$REPO_PATH"
-# Always update development (our integration branch); also fetch the target branch if it exists on origin (needed for respawns)
-git fetch origin development --quiet 2>/dev/null || true
+# Refresh the integration branch (where new work branches off) + the target
+# branch if it already exists on origin (needed for respawns).
+git fetch origin "$MAIN_BRANCH" --quiet 2>/dev/null || true
 git fetch origin "$BRANCH" --quiet 2>/dev/null || true
 
 # If the requested branch is already attached to another worktree, auto-suffix.
@@ -142,8 +155,10 @@ find "$REPO_PATH/.git" -type f -name "index.lock" -mmin +5 -print -delete 2>/dev
 if [ -d "$WORKTREE_DIR" ]; then
   echo "Worktree $WORKTREE_DIR already exists, reusing..."
 else
-  # Base all new work on origin/development. Agents must never branch from main.
-  git worktree add -b "$BRANCH" "$WORKTREE_DIR" origin/development 2>/dev/null || \
+  # Base all new work on origin/$MAIN_BRANCH. Agents must never branch from
+  # another main/trunk (CLAWDBOT_MAIN_BRANCH in .env defines the integration
+  # source; on Canopy this is `develop`, on Dimitri's setup it's `main`).
+  git worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$MAIN_BRANCH" 2>/dev/null || \
     git worktree add "$WORKTREE_DIR" "$BRANCH" 2>/dev/null || \
     git worktree add "$WORKTREE_DIR" "origin/$BRANCH" 2>/dev/null || \
     { echo "Failed to create worktree"; exit 1; }
@@ -209,6 +224,8 @@ set -euo pipefail
 # Load configuration
 CLAWDBOT_HOME="${CLAWDBOT_HOME:-$HOME/.clawdbot}"
 [ -f "$CLAWDBOT_HOME/.env" ] && set -a && source "$CLAWDBOT_HOME/.env" && set +a
+# Signal the ~/.openclaw/bin shims that we're a legitimate spawn context.
+export SPAWN_AGENT_CONTEXT=1
 export PATH="$CLAWDBOT_BIN_DIR:${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}:$HOME/.local/bin:\$PATH"
 export REAL_GH_BIN="$REAL_GH_BIN"
 export _CLAWDBOT_TARGET_BRANCH="$_INTEGRATION"
@@ -223,27 +240,55 @@ cd "$WORKTREE_DIR"
 # Reconcile task state immediately when the agent process exits.
 trap 'ec=\$?; $HOME/.clawdbot/finalize-task.sh "$TASK_ID" "$REPO_PATH" "$BRANCH" "\$ec" || true' EXIT
 
-# Force a recognizable git identity per agent so commits are attributable.
-case "$AGENT" in
-  codex)  git config user.name "Aira Swarm (Codex)";  git config user.email "aira-swarm+codex@users.noreply.github.com" ;;
-  claude) git config user.name "Aira Swarm (Claude)"; git config user.email "aira-swarm+claude@users.noreply.github.com" ;;
-  gemini) git config user.name "Aira Swarm (Gemini)"; git config user.email "aira-swarm+gemini@users.noreply.github.com" ;;
-  *)      ;;
-esac
+# Commit as Mira (matches her existing commits) so Vercel's GitHub
+# integration recognizes the author and deploys previews. Agent attribution
+# is preserved via (a) the branch name "agents/<task-id>", (b) the PR body
+# footer added by the gh wrapper, and (c) a "Generated-by:" trailer the
+# agent is instructed to add in its commit message (see prompt append).
+git config user.name "lkdimitrova"
+git config user.email "lyubomira.dimitrova91@gmail.com"
 
 ${INSTALL_CMD}
 exec ${AGENT_CMD}
 EOF
 chmod +x "$RUNNER"
 
-# Ensure we don't reuse a half-dead session
-if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  tmux kill-session -t "$TMUX_SESSION" || true
-fi
+# ── Launch runner (nohup primary + tmux observability wrapper) ──
+#
+# Primary launch is `nohup … </dev/null &` + `disown`. This is bulletproof
+# against parent-kill: even if OpenClaw's exec tool SIGKILLs the whole
+# child-process tree when `spawn-agent.sh` exits, the nohup'd runner has
+# already daemonized and survives.
+#
+# `tmux new-session` is attempted as a best-effort observability wrapper:
+# it tails the log so `tmux attach -t agent-<task-id>` works for live
+# debugging when tmux is available. If tmux fails (known to happen inside
+# some OpenClaw exec contexts — the session dies instantly despite working
+# in a normal terminal), we skip silently; the runner is already running
+# independently and will complete.
 
-tmux new-session -d -s "$TMUX_SESSION" \
-  "script -f '$LOG_DIR/$TASK_ID.log' -c 'bash \"$RUNNER\"'" || \
-  { echo "Failed to create tmux session $TMUX_SESSION"; exit 1; }
+: > "$LOG_DIR/$TASK_ID.log"   # truncate any stale log from a prior run
+nohup bash "$RUNNER" >> "$LOG_DIR/$TASK_ID.log" 2>&1 </dev/null &
+RUNNER_PID=$!
+disown "$RUNNER_PID" 2>/dev/null || true
+
+# Best-effort tmux observability. Never fatal.
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+fi
+tmux new-session -d -s "$TMUX_SESSION" "tail -F '$LOG_DIR/$TASK_ID.log'" 2>/dev/null || true
+
+# Verify the nohup'd runner actually started (catches the case where bash
+# fails immediately — missing binary in PATH, syntax error in runner, etc.).
+sleep 1
+if ! kill -0 "$RUNNER_PID" 2>/dev/null; then
+  # It may have finished that fast, which is fine if the log shows success.
+  # Only fail when the log is empty AND process is gone — indicates startup failure.
+  if [ ! -s "$LOG_DIR/$TASK_ID.log" ]; then
+    echo "Runner pid $RUNNER_PID exited immediately with no output; check $LOG_DIR/$TASK_ID.log" >&2
+    exit 1
+  fi
+fi
 
 # ── Register task ──
 REPO_NAME=$(basename "$REPO_PATH")
@@ -252,6 +297,7 @@ SAFE_DESC=$(echo "$PROMPT" | head -c 200 | tr -d '"\\' | tr '\n' ' ')
 
 jq --arg id "$TASK_ID" \
    --arg tmux "$TMUX_SESSION" \
+   --argjson pid "$RUNNER_PID" \
    --arg agent "$AGENT" \
    --arg model "$MODEL" \
    --arg desc "$SAFE_DESC" \
@@ -260,7 +306,7 @@ jq --arg id "$TASK_ID" \
    --arg worktree "$WORKTREE_DIR" \
    --arg branch "$BRANCH" \
    --argjson now "$NOW_MS" \
-   '. += [{id: $id, tmuxSession: $tmux, agent: $agent, model: $model, description: $desc, repo: $repo, repoPath: $repoPath, worktree: $worktree, branch: $branch, startedAt: $now, status: "running", respawnCount: 0, maxRespawns: 3, notifyOnComplete: true}]' \
+   '. += [{id: $id, tmuxSession: $tmux, runnerPid: $pid, agent: $agent, model: $model, description: $desc, repo: $repo, repoPath: $repoPath, worktree: $worktree, branch: $branch, startedAt: $now, status: "running", respawnCount: 0, maxRespawns: 3, notifyOnComplete: true}]' \
    "$REGISTRY" > "$REGISTRY.tmp" && mv "$REGISTRY.tmp" "$REGISTRY"
 
 echo "✅ Agent spawned:"
