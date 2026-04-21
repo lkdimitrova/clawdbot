@@ -129,10 +129,21 @@ printf '%s' "$PROMPT" > "$PROMPT_FILE"
 cat >> "$PROMPT_FILE" <<EOF
 
 ---
+## Before you start
+
+Read \`.clawdbot_global_rules.md\` in the repo root (untracked, written by
+spawn-agent.sh) for cross-repo agent conventions: TDD requirements,
+conventional commits, PR body templates, the "Don't" list. These apply
+on top of the repo's own \`AGENTS.md\` / \`CLAUDE.md\`.
+
+\`.clawdbot_global_rules.md\` and \`.clawdbot_prompt.md\` are both listed
+in \`.git/info/exclude\` — they'll never show up in \`git status\`, so
+\`git add -A\` is safe.
+
 ## When you are completely finished with the coding task above:
 
 1. Run all tests and make sure they pass.
-2. Stage all changes: \`git add -A\`
+2. Stage all changes: \`git add -A\` (runtime artifacts are excluded)
 3. Commit with a conventional commit message. In the message body, add a
    \`Generated-by:\` trailer so the swarm agent that authored the work is
    attributable (the commit author itself is the maintainer, so Vercel /
@@ -184,22 +195,64 @@ else
     { echo "Failed to create worktree"; exit 1; }
 fi
 
-# ── Inject global AGENTS.md (merge with repo-local) ──
+# ── Make global clawdbot rules available alongside the repo's AGENTS.md ──
+#
+# Earlier versions appended global clawdbot rules to the repo-local
+# AGENTS.md in the worktree. That modified a *tracked* file, which coding
+# agents then happily included in their commits via `git add -A` —
+# polluting merged PRs with cross-repo tooling concerns (TDD rules,
+# ~/antigravity-awesome-skills/ paths, etc.) that don't belong in the
+# repo's source of truth. Caught by the swarm-review reviewer on PRs
+# #158 and #159.
+#
+# Fix: write global rules to a SEPARATE file (.clawdbot_global_rules.md)
+# that's gitignored via .git/info/exclude below, and point the agent at
+# it in the prompt's completion instructions. Repo-local AGENTS.md stays
+# untouched.
 GLOBAL_AGENTS="$HOME/.clawdbot/AGENTS.md"
+WORKTREE_GLOBAL_RULES="$WORKTREE_DIR/.clawdbot_global_rules.md"
 if [ -f "$GLOBAL_AGENTS" ]; then
-  if [ -f "$WORKTREE_DIR/AGENTS.md" ]; then
-    # Append global rules to repo-local AGENTS.md (repo-specific first, then global)
-    printf '\n\n---\n# Global Agent Rules\n\n' >> "$WORKTREE_DIR/AGENTS.md"
-    cat "$GLOBAL_AGENTS" >> "$WORKTREE_DIR/AGENTS.md"
-  else
-    cp "$GLOBAL_AGENTS" "$WORKTREE_DIR/AGENTS.md"
-  fi
+  cp "$GLOBAL_AGENTS" "$WORKTREE_GLOBAL_RULES"
 fi
 
 # ── Make prompt available inside worktree ──
 # Gemini CLI restricts file access to the current workspace dir, so copy prompt there.
 WORKTREE_PROMPT_FILE="$WORKTREE_DIR/.clawdbot_prompt.md"
 cp "$PROMPT_FILE" "$WORKTREE_PROMPT_FILE"
+
+# ── Local-only gitignore for clawdbot runtime artifacts ──
+#
+# .git/info/exclude is the per-worktree equivalent of .gitignore that
+# does NOT get committed. It applies only to *untracked* files, which is
+# exactly what we need: the two files spawn-agent.sh writes into the
+# worktree (.clawdbot_prompt.md, .clawdbot_global_rules.md) are both
+# new/untracked, so excluding them here makes `git add -A` skip them
+# entirely.
+#
+# We do NOT exclude webapp/package-lock.json here — that file is
+# tracked, and an agent legitimately updating deps would need the
+# lockfile update to land. The swarm-review reviewer already flags
+# incidental +N-thousand-line package-lock.json diffs as BLOCK when
+# package.json isn't also changed, so the review gate covers that case.
+# git's worktree model shares `.git/info/` across all worktrees and the
+# main checkout (HEAD/index/logs are per-worktree, info/config/hooks
+# are shared). So we append to the MAIN repo's exclude file — the
+# pattern then applies in every linked worktree + the main checkout,
+# which is exactly what we want (nobody should ever commit these
+# clawdbot runtime artifacts).
+#
+# $REPO_PATH is always the main checkout by spawn-agent.sh contract
+# (never a linked worktree), so $REPO_PATH/.git is a real directory.
+_REPO_GIT_EXCLUDE="$REPO_PATH/.git/info/exclude"
+if [ -d "$REPO_PATH/.git/info" ]; then
+  # Append only if not already present (idempotent — reusing an existing
+  # worktree or spawning a second task won't duplicate the lines).
+  for _pat in ".clawdbot_prompt.md" ".clawdbot_global_rules.md"; do
+    if ! grep -qxF "$_pat" "$_REPO_GIT_EXCLUDE" 2>/dev/null; then
+      echo "$_pat" >> "$_REPO_GIT_EXCLUDE"
+    fi
+  done
+fi
 
 # ── Build agent command (interactive mode, prompt file as instruction) ──
 # Elvis's approach: interactive mode in tmux (not exec), enables multi-step work + mid-task steering
